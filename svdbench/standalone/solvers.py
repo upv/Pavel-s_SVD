@@ -353,8 +353,16 @@ def get_polynomial(Ext):
         for j in range(n):
             M[i, j] = Ext[i] ** (2 * j + 1)
         M[i, n] = (-1) ** (i + 1)
-    c = torch.linalg.solve(M, torch.ones(n + 1, dtype=Ext.dtype, device=Ext.device))
-    return c
+    return _solve_square(M, torch.ones(n + 1, dtype=Ext.dtype, device=Ext.device))
+
+
+def _solve_square(m, rhs):
+    """x with m x = rhs via the standalone Householder QR; RuntimeError when m is singular."""
+    q, r = P.qr(m[None])
+    pivots = r[0].diagonal().abs()
+    if not bool(pivots.min() > P._eps(m.dtype) * len(pivots) * pivots.max()):
+        raise RuntimeError('singular system')
+    return P.trsm_upper(r, q.mH @ rhs[None, :, None])[0, :, 0]
 
 
 def get_ext(c):
@@ -420,19 +428,30 @@ def kovarik_formula(degree):
     return p
 
 def poly_roots(coeffs):
-    n = len(coeffs) - 1
+    """Complex roots of coeffs[0] x^n + ... + coeffs[n] by Durand-Kerner iteration.
 
-    c = - coeffs[1:] / coeffs[0]
-
-    A = torch.zeros(n,n, dtype=torch.complex128, device=coeffs.device)
-
-    A[1:,:-1] = torch.eye(n-1)
-
-    A[0, :] = c
-
-    eig = torch.linalg.eigvals(A)
-
-    if torch.isnan(eig).any() or torch.isinf(eig).any():
+    Plain arithmetic instead of the eigenvalues of the companion matrix, so that no
+    library eigensolver is called.
+    """
+    c = coeffs.to(torch.complex128)
+    n = len(c) - 1
+    if n < 1:
+        return c[:0]
+    c = c / c[0]
+    radius = 1 + float(c[1:].abs().max())
+    angles = 2 * math.pi * (torch.arange(n, dtype=torch.float64, device=c.device) + 0.25) / n
+    z = torch.polar(torch.full((n,), radius, dtype=torch.float64, device=c.device), angles)
+    off_diagonal = ~torch.eye(n, dtype=torch.bool, device=c.device)
+    for _ in range(500):
+        value = torch.zeros_like(z)
+        for coefficient in c:                       # Horner
+            value = value * z + coefficient
+        differences = z[:, None] - z[None, :]
+        gaps = torch.where(off_diagonal, differences, torch.ones_like(differences))
+        step = value / gaps.prod(1)
+        z = z - step
+        if bool(step.abs().max() <= 1e-14 * radius):
+            break
+    if torch.isnan(z).any() or torch.isinf(z).any():
         raise RuntimeError('Error in polyroot evaluation')
-
-    return eig
+    return z
