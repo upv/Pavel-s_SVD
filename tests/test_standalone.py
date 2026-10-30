@@ -143,6 +143,18 @@ class Standalone(unittest.TestCase):
         cores, _ = tensor_train(low, [1, 1])
         self.assertLess(error(low, tensor_train_reconstruct(cores)), 1e-11)
 
+    def test_cans_helpers_without_vendor_calls(self):
+        from svdbench.standalone.solvers import poly_roots, get_polynomial, _solve_square
+        roots = poly_roots(torch.tensor([1., -6., 11., -6.], dtype=torch.float64))
+        np.testing.assert_allclose(np.sort(roots.real.numpy()), [1, 2, 3], atol=1e-10)
+        self.assertLess(float(roots.imag.abs().max()), 1e-10)
+        m = torch.tensor([[4., 1., 0.], [1., 3., 1.], [0., 1., 2.]], dtype=torch.float64)
+        rhs = torch.tensor([1., 2., 3.], dtype=torch.float64)
+        np.testing.assert_allclose((m @ _solve_square(m, rhs)).numpy(), rhs.numpy(), atol=1e-12)
+        c = get_polynomial(torch.linspace(1.5, .5, 3, dtype=torch.float64))
+        self.assertEqual(tuple(c.shape), (3,))
+        self.assertTrue(bool(torch.isfinite(c).all()))
+
     def test_no_vendor_factorizations_and_immutable_input(self):
         forbidden = ['svd', 'svdvals', 'qr', 'eigh', 'eig', 'eigvalsh', 'cholesky', 'solve', 'inv']
         from contextlib import ExitStack
