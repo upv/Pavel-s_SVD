@@ -155,6 +155,21 @@ class Standalone(unittest.TestCase):
         self.assertEqual(tuple(c.shape), (3,))
         self.assertTrue(bool(torch.isfinite(c).all()))
 
+    def test_cans_remez_schedule(self):
+        from svdbench.standalone.solvers import remez
+        p, e = remez(0.1, 1.0, 3)                       # optimal odd cubic for f == 1 on [0.1, 1]
+        x = torch.linspace(0.1, 1.0, 2001, dtype=torch.float64)
+        err = (sum(p[k] * x ** k for k in range(len(p))) - 1).abs()
+        self.assertTrue(0 < e < 1)
+        self.assertAlmostEqual(float(err.max()), e, delta=1e-9)
+        self.assertEqual(float(p[0::2].abs().max()), 0.)
+        a = tensor(np.random.default_rng(4).normal(size=(40, 25)))
+        lower = float(torch.linalg.svdvals(a)[-1] / torch.linalg.norm(a)) * 0.9
+        plain = svd(a, 'polar_cans', return_info=True)[3]['polar_iterations']
+        u, s, vh, info = svd(a, 'polar_cans', cans_bounds=(lower, 1.0), return_info=True)
+        self.assertLess(info['polar_iterations'], plain)
+        self.assertLess(error(a, (u * s) @ vh), 1e-12)
+
     def test_no_vendor_factorizations_and_immutable_input(self):
         forbidden = ['svd', 'svdvals', 'qr', 'eigh', 'eig', 'eigvalsh', 'cholesky', 'solve', 'inv']
         from contextlib import ExitStack
