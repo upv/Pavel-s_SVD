@@ -131,6 +131,8 @@ def _polar(a, stats, opts, method):
         raise ValueError('lower_bound must be in (0,1]')
     max_iter = opts.get('max_iter', 120 if method in ('polar_newton_schulz', 'polar_polynomial', 'polar_cans') else 40)
     converged = False
+    use_remez = bool(opts.get('cans_bounds'))
+    cans_bounds = opts.get('cans_bounds') or (tol, 1+tol)
     for it in range(max_iter):
         g = x.mH @ x
         if method == 'polar_newton_schulz':
@@ -139,19 +141,25 @@ def _polar(a, stats, opts, method):
             xn = x @ (15 * ident - 10 * g + 3 * (g @ g)) / 8
         elif method == 'polar_cans':
             order = opts.get('cans_order') or 3
-            bounds = opts.get('cans_bounds') or (tol, 1+tol)
-            A, B = bounds
-            C = torch.zeros(order, device=a.device)
+            A, B = cans_bounds
+            C = torch.zeros(order, dtype=torch.float64)
             if order == 2:
                 C[0] = 2*(A ** 2 + A*B + B ** 2) / \
                     (2 * ((A ** 2 + A*B + B ** 2)/3) ** 1.5 + A**2 * B + A*B**2)
                 C[1] = - 2 / (2 * ((A ** 2 + A*B + B ** 2)/3) ** 1.5 + A**2 * B + A*B**2)
                 e = (2 * ((A ** 2 + A*B + B ** 2)/3) ** 1.5 - A**2 * B - A*B**2) / \
                     (2 * ((A ** 2 + A*B + B ** 2)/3) ** 1.5 + A**2 * B + A*B**2)
-            else:
-                c_all,e = remez(A, B, order) 
+            elif use_remez:
+                c_all, e = remez(A, B, order)
                 C = c_all[1::2]
-            opts['cans_bounds'] = (1-e, 1+e)
+            else:
+                # Without spectrum bounds the fixed Kovarik polynomial (Newton-Schulz for order 3)
+                # is used; a Remez schedule built for the worst-case lower bound is slower.
+                C, e = kovarik_formula(order)[1::2], 0.
+            # p maps [A, B] into [1-e, 1+e]; the image of A keeps the lower bound positive when
+            # rounding makes e slightly larger than 1 on a nearly singular start.
+            image_of_a = sum(float(C[j]) * A ** (2 * j + 1) for j in range(len(C)))
+            cans_bounds = (max(1 - float(e), image_of_a), 1 + float(e))
             xn = C[0] * x
             gg = g
             for i in range(1, C.shape[0]):
@@ -366,39 +374,51 @@ def _solve_square(m, rhs):
 
 
 def get_ext(c):
+    """Interior extremum points of p(x) = sum_j c[j] x^(2j+1): positive real roots of p'(x)."""
     n = len(c)
     coeffs = [(2 * j + 1) * c[j] for j in range(n)]
-    rts = poly_roots(torch.tensor(coeffs[::-1], device=c.device))
-    return torch.sqrt(rts)
+    rts = poly_roots(torch.stack(coeffs[::-1]))
+    if bool((rts.imag.abs() > 1e-8 * rts.abs().clamp_min(1)).any()) or bool((rts.real <= 0).any()):
+        raise RuntimeError('Remez: extremum points are not real and positive')
+    return rts.real.sqrt().sort(descending=True).values
+
+
+def _odd_poly(c, x):
+    return sum(c[j] * x ** (2 * j + 1) for j in range(len(c)))
 
 
 def remez_step(Ext):
+    """One Remez exchange step on the alternation points Ext (descending, endpoints fixed)."""
     n = len(Ext) - 1
     c = get_polynomial(Ext)
-    coeffs = [c[j // 2 - 1] if j % 2 == 0 else 0 for j in range(1, 2 * n + 1)]
-    p = coeffs[::-1]
-    e = c[n].item()
-    NewExt = torch.concatenate((Ext[0], get_ext(c[:n]), Ext[-1]))
-    f = lambda x: torch.abs(sum(a * x**i for i, a in enumerate(p)) - 1) # np.abs(p(x) - 1)
-    newe = torch.max(f(NewExt))
-    return coeffs, NewExt, e, newe
+    e = float(c[n])
+    inner = get_ext(c[:n])
+    if len(inner) != n - 1 or not bool(((inner < Ext[0]) & (inner > Ext[-1])).all()):
+        raise RuntimeError('Remez: extremum points left the segment')
+    NewExt = torch.cat((Ext[:1], inner, Ext[-1:]))
+    newe = float((_odd_poly(c[:n], NewExt) - 1).abs().max())
+    return c[:n], NewExt, e, newe
 
 
 def remez(A, B, degree):
-    # Remez algorithm for finding optimal polynomial approximating the unity function f==1
-    # on the segment [A, B]
-    
-    Ext = torch.linspace(B, A, (degree + 1) // 2 + 1)
-    p = 0.0
-    newe = 0
-    for i in range(100):
+    """Optimal odd polynomial of `degree` approximating f == 1 on [A, B] (Remez algorithm).
+
+    Returns the coefficients of x^0..x^degree (even ones are zero) and the maximal error e,
+    so the polynomial maps [A, B] into [1 - e, 1 + e]. Falls back to Kovarik's polynomial
+    with e = 0 when the system is singular, which happens once the segment has shrunk to 1.
+    """
+    Ext = torch.linspace(float(B), float(A), (degree + 1) // 2 + 1, dtype=torch.float64)
+    p, newe = None, 0.
+    for _ in range(100):
         try:
-            p, NewExt, e, newe = remez_step(Ext)
+            odd, NewExt, e, newe = remez_step(Ext)
         except RuntimeError:
-            return kovarik_formula(degree), 0  # if the segment converged to [A, B]=[1, 1]
-        if newe < abs(e) + 1e-20:
-            return p, newe
-        Ext = torch.array(NewExt)
+            return kovarik_formula(degree), 0.
+        p = torch.zeros(degree + 1, dtype=torch.float64)
+        p[1::2] = odd
+        if newe <= abs(e) * (1 + 1e-9) + 1e-20:
+            break
+        Ext = NewExt
     return p, newe
 
 
